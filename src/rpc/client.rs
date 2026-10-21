@@ -18,6 +18,9 @@ use crate::rpc::retry::{DEFAULT_MAX_RETRIES, with_retry};
 /// CLI's `--timeout` default (30 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default maximum number of completed deduplication entries before LRU eviction.
+const DEFAULT_MAX_COMPLETED_DEDUP_ENTRIES: usize = 256;
+
 /// Default TCP connection establishment timeout applied to every RPC call.
 /// Matches the CLI's `--connect-timeout` default (5 seconds).
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -177,16 +180,36 @@ impl SharedFuture {
 /// operations such as `estimate-all`, where several functions share the same
 /// WASM upload path and would otherwise transmit the identical upload request
 /// over and over.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DedupState {
     /// Results of identical requests that already completed successfully,
     /// keyed by request. A cache hit skips the network entirely and also lets
     /// a request arriving *after* its twin finished share the result.
+    /// Bounded by [`DEFAULT_MAX_COMPLETED_DEDUP_ENTRIES`] with deterministic
+    /// LRU eviction: when the bound is exceeded, the least-recently-used entry
+    /// is evicted.
     completed: HashMap<RequestKey, Value>,
+    /// Access order for LRU eviction of completed entries (most recently
+    /// used at the back). Updated on cache hits and inserts.
+    order: Vec<RequestKey>,
     /// One single-flight handle per key currently in flight. Concurrent
     /// identical callers attach to the existing handle rather than opening a
     /// second request.
     in_flight: HashMap<RequestKey, SharedFuture>,
+    /// Maximum number of completed entries to retain before LRU eviction.
+    /// Defaults to [`DEFAULT_MAX_COMPLETED_DEDUP_ENTRIES`].
+    max_completed_entries: usize,
+}
+
+impl Default for DedupState {
+    fn default() -> Self {
+        Self {
+            completed: HashMap::default(),
+            order: Vec::default(),
+            in_flight: HashMap::default(),
+            max_completed_entries: DEFAULT_MAX_COMPLETED_DEDUP_ENTRIES,
+        }
+    }
 }
 
 /// Response envelope for the `getHealth` JSON-RPC method.
@@ -269,6 +292,33 @@ impl RpcClient {
         Self::with_options(url, rps, DEFAULT_TIMEOUT, DEFAULT_MAX_RETRIES, verbose)
     }
 
+    /// Create a new RPC client pointing at the given URL, with a bound on the
+    /// maximum number of completed deduplication entries. Beyond this bound,
+    /// least-recently-used entries are evicted deterministically so that
+    /// `completed` never grows unbounded. In-flight single-flight entries are
+    /// unaffected — they remain separate from the evictable completed cache.
+    pub fn with_max_completed_dedup_entries(url: &str, max_entries: usize) -> Self {
+        let dedup = DedupState {
+            max_completed_entries: if max_entries == 0 {
+                DEFAULT_MAX_COMPLETED_DEDUP_ENTRIES
+            } else {
+                max_entries
+            },
+            ..DedupState::default()
+        };
+        Self::from_parts(
+            url,
+            None,
+            None,
+            DEFAULT_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
+            0,
+            HeaderMap::new(),
+            false,
+            dedup,
+        )
+    }
+
     /// Create a new RPC client pointing at the given URL, optionally capping
     /// outbound requests to `rps` requests per second, bounding each HTTP
     /// request with `timeout`, and retrying transient failures up to
@@ -316,6 +366,7 @@ impl RpcClient {
             max_retries,
             HeaderMap::new(),
             false,
+            DedupState::default(),
         )
     }
 
@@ -352,6 +403,7 @@ impl RpcClient {
             max_retries,
             HeaderMap::new(),
             verbose,
+            DedupState::default(),
         )
     }
 
@@ -468,6 +520,7 @@ impl RpcClient {
         max_retries: usize,
         headers: HeaderMap,
         verbose: bool,
+        dedup: DedupState,
     ) -> Self {
         Self {
             url: url.to_string(),
@@ -483,7 +536,7 @@ impl RpcClient {
                 .default_headers(headers.clone())
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
-            dedup: Arc::new(Mutex::new(DedupState::default())),
+            dedup: Arc::new(Mutex::new(dedup)),
             limiter: rps.and_then(build_rate_limiter),
             max_retries,
             connect_timeout,
@@ -621,6 +674,13 @@ impl RpcClient {
                 let mut state = self.dedup.lock().await;
                 if let Ok(value) = &result {
                     state.completed.insert(key.clone(), value.clone());
+                    // Maintain LRU eviction: if we exceed the bound, evict the
+                    // least-recently-used entry (the front of the access order).
+                    state.order.push(key.clone());
+                    while state.order.len() > state.max_completed_entries {
+                        let evict_key = state.order.remove(0);
+                        state.completed.remove(&evict_key);
+                    }
                 }
                 state.in_flight.remove(&key);
             }
@@ -648,10 +708,20 @@ impl RpcClient {
     }
 
     /// Returns the cached result for `key`, if a prior identical request
-    /// completed successfully.
+    /// completed successfully. Also refreshes the LRU recency order so that
+    /// recently-used entries are preserved when the eviction bound is reached.
     async fn cached_result(&self, key: &RequestKey) -> Option<Value> {
-        let state = self.dedup.lock().await;
-        state.completed.get(key).cloned()
+        let mut state = self.dedup.lock().await;
+        if let Some(value) = state.completed.get(key) {
+            // Refresh recency: move key to the back of the access order.
+            if let Some(pos) = state.order.iter().position(|k| k == key) {
+                state.order.remove(pos);
+            }
+            state.order.push(key.clone());
+            Some(value.clone())
+        } else {
+            None
+        }
     }
 
     /// Performs the actual HTTP POST and extracts the raw `result` value.
