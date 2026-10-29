@@ -69,7 +69,7 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 | `--diff` | | | `false` | Compare two WASM builds side by side. Requires `--wasm-new` |
 | `--wasm-new <PATH>` | | | — | The "new" WASM build to compare against when `--diff` is set |
 | `--json` | | | `false` | Output as JSON instead of a human-readable table |
-| `--format <FORMAT>` | | | `table` | Output format: `table`, `json`, `csv`, or `markdown` (overrides `--json`) |
+| `--format <FORMAT>` | | | `table` | Output format: `table`, `json`, `csv`, `markdown`, or `summary` (overrides `--json`) |
 | `--precision <N>` | | | `7` | Decimal places for XLM fee values (`0..=18`) |
 | `--help` | `-h` | | | Print help |
 
@@ -356,6 +356,7 @@ soroban-cost-estimator config snapshot <COMMAND>
 | `--retain <N>` | | — | Automatically delete snapshots older than N days |
 | `--json` | | `false` | Print the snapshot as JSON (still saves it) |
 | `--retain <COUNT>` | | | Keep only the N most recent snapshots, pruning older ones after the save |
+| `--skip-unchanged` | | `false` | Do not write a new snapshot when the fetched configuration matches the latest one |
 | `--help` | `-h` | | Print help |
 
 **Subcommands**
@@ -375,8 +376,17 @@ soroban-cost-estimator config snapshot <COMMAND>
   timestamp makes every snapshot a versioned artifact.
 - `--json` also prints the full snapshot as JSON to stdout.
 - `--out` writes to an explicit path instead of the default directory.
+- New snapshots carry `"schema_version": 1`. Unversioned legacy files are
+  read as that same initial version and are never rewritten by a read. A file
+  declaring a newer version is rejected with its path and an upgrade hint.
+- `--skip-unchanged` compares the fetched network, protocol version and six
+  config settings against the latest snapshot and writes nothing when they
+  match. Capture metadata (timestamp, last-modified ledger, schema version)
+  never forces a new file. The command exits `0` whether it saved or skipped;
+  `--json` reports `"status": "unchanged"` when it skipped.
 - `--retain <COUNT>` runs a retention pass once the new snapshot is safely on
-  disk, and logs how many snapshots it pruned.
+  disk, and logs how many snapshots it pruned. It also runs after an unchanged
+  capture, so an existing directory is still trimmed.
 - `prune` deletes stale files by age. It is pure file I/O — no RPC call — so it
   is safe to schedule offline. It is also mutually exclusive with this
   command's fetching flags (`--out`, `--retain`), so `config snapshot --retain
@@ -439,13 +449,14 @@ soroban-cost-estimator config snapshot prune --network testnet --older-than 30
 ```text
 Config snapshot saved to: /home/you/.soroban-cost-estimator/snapshots/testnet-2026-08-04T07-15-38.487702259+00-00.json
 Network: testnet
-Ledger:  3470630
+Ledger:  4635341
 Time:    2026-08-04T07:15:38.487702259+00:00
 ```
 
-The printed `Ledger` is the last ledger at which the config entries were
-modified on-chain — it is *not* the network's current ledger, and that is
-intentional: it is the ledger against which stale-cache checks are made.
+The printed `Ledger` is the network's **current** ledger at fetch time, as
+reported by the node's `latestLedger` — it is the ledger against which stale-cache
+checks are made. The per-setting modification ledgers are kept separately in
+`settings_last_modified`; see [`config snapshot`](commands/config-snapshot.md).
 
 ---
 
@@ -470,7 +481,7 @@ soroban-cost-estimator config diff [OPTIONS]
 | `--pricing-only` | | `false` | Hide non-pricing changes and display only fee-rate adjustments |
 | `--threshold-percent <N>` | | none | Percentage threshold for flagging significant changes (e.g. 10 for 10%) |
 | `--summary` | | `false` | Print a single-line count summary instead of the full diff (for CI status lines) |
-| `--format <FORMAT>` | | `table` | Output format: `table`, `json`, `csv`, or `markdown` |
+| `--format <FORMAT>` | | `table` | Output format: `table`, `json`, `csv`, `markdown`, or `summary` |
 | `--json` | | `false` | Legacy alias for `--format json` |
 | `--ignore-pricing-exit` | | `false` | Force exit code 0 even when pricing changes are detected |
 | `--fail-on-any-change` | | `false` | Exit 1 when any setting changed, even non-pricing settings |
@@ -787,14 +798,16 @@ Checked 5 cache entries.
 
 ---
 
-### `cache warm`
+### `config cache warm` / `cache warm`
 
-Pre-populate the cache by estimating every exported function (equivalent to
-running [`estimate-all`](#estimate-all)).
+Pre-populate the cache by estimating exported contract functions with
+deterministic default arguments. Both `config cache warm` and `cache warm` are
+accepted.
 
 **Usage**
 
 ```
+soroban-cost-estimator config cache warm [OPTIONS] --wasm <WASM>
 soroban-cost-estimator cache warm [OPTIONS] --wasm <WASM>
 ```
 
@@ -804,24 +817,34 @@ soroban-cost-estimator cache warm [OPTIONS] --wasm <WASM>
 |------|-------|----------|---------|-------------|
 | `--wasm <WASM>` | `-w` | ✅ | — | Path to the compiled Soroban contract `.wasm` file |
 | `--network <NETWORK>` | | | `testnet` | Network to simulate against |
+| `--rpc-url <RPC_URL>` | | | — | Explicit RPC URL (overrides network-based resolution) |
 | `--id <ID>` | | | — | Deployed contract ID (64 hex chars) to invoke each function against |
-| `--json` | | | `false` | Output as JSON instead of a human-readable list |
+| `--json` | | | `false` | Output the warm-up summary as JSON |
 | `--help` | `-h` | | | Print help |
 
 **Behavior**
 
-- Internally delegates to `estimate-all` — enumerates all exported functions
-  and simulates each zero-argument one against the network.
-- Each successful simulation is saved to the cache, keyed by
+- Simulates exported functions against the network, inferring deterministic
+  defaults from contract-spec types (e.g. `false` for bool, `0` for numbers,
+  `00` for bytes, `warm` for symbol/string).
+- Each successful simulation is saved to the local cache, keyed by
   `wasm_hash + function_name + args_hash`.
-- Useful for warming the cache before running `estimate` with `--cache-ttl`,
-  so the first call in a CI pipeline hits the cache instead of triggering a
-  fresh simulation.
+- Displays a progress bar on stderr during warm-up. On completion, stdout
+  reports `Warmed X functions into cache for <wasm_hash>` (or structured JSON with `--json`).
+- Exits with 0 on completion.
 
 **Examples**
 
 ```bash
-soroban-cost-estimator cache warm \
+soroban-cost-estimator config cache warm \
+  --wasm tests/fixtures/contract.wasm \
+  --network testnet
+```
+
+With deployed contract ID:
+
+```bash
+soroban-cost-estimator config cache warm \
   --wasm tests/fixtures/contract.wasm \
   --id CC4WIEYYSCFGDJXMLZ73FKUUJNDEOJRNOOBZHI55QR27NW4RCNTHAQ5T \
   --network testnet
@@ -1015,8 +1038,10 @@ soroban-cost-estimator cache export --network testnet --out testnet-backup.json
 
 ### `watch`
 
-Poll the network's resource-pricing configuration on an interval and print a
-diff whenever something changes.
+Watch the network's resource-pricing configuration and print a diff whenever
+something changes. Subscribes to **ledger-close notifications over a
+WebSocket** so a config change is re-checked the moment its ledger lands, and
+falls back to interval polling when WebSockets are unavailable.
 
 **Usage**
 
@@ -1029,12 +1054,19 @@ soroban-cost-estimator watch [OPTIONS]
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
 | `--network <NETWORK>` | | `testnet` | Network to watch |
-| `--interval <INTERVAL>` | | `1h` | Polling interval (accepts `s`/`m`/`h`/`d` suffixes or bare seconds) |
+| `--rpc-url <RPC_URL>` | | | Explicit RPC URL used for both the WebSocket subscription and the config fetches (`wss://`/`ws://` or `https://`/`http://`) |
+| `--interval <INTERVAL>` | | `1h` | Polling interval, used as the fallback when WebSocket notifications are unavailable (accepts `s`/`m`/`h`/`d` suffixes or bare seconds) |
 | `--help` | `-h` | | Print help |
 
 **Behavior**
 
-- Polls **immediately**, then every `--interval`.
+- Connects to the node's WebSocket endpoint (`wss://…/ws`) and re-checks the
+  config **on every ledger close**; the network's HTTP endpoint is derived from
+  `--rpc-url` when one is given.
+- Reconnects with exponential backoff (1s, 2s, 4s, … capped at 30s) after a
+  dropped connection, then resubscribes from the last ledger seen.
+- Falls back to polling **immediately**, then every `--interval`, when the
+  endpoint cannot be reached or does not support WebSocket subscriptions.
 - Intervals accept `s`/`m`/`h`/`d` suffixes or bare seconds:
   `3600`, `3600s`, `30m`, `1h`, `1d`. Unparseable input falls back to
   one hour.
@@ -1064,6 +1096,8 @@ soroban-cost-estimator watch --network mainnet --interval 10m
 
 ```text
 Watching testnet for config changes every 3600s... (Ctrl-C to stop)
+Subscribed to ledger-close notifications from ledger 3894195 — re-checking config on every new ledger.
+Ledger 3894196 closed — re-checking config.
 Received stop signal — exiting cleanly.
 ```
 
@@ -1079,7 +1113,7 @@ All commands accept:
 |------|-------------|
 | `--rps <N>` | Cap RPC requests at N per second (0 disables) |
 | `--timeout <SECS>` | HTTP request timeout for RPC calls in seconds (default `30`) |
-| `--format <FORMAT>` | Report format for commands that support it: `table`, `json`, `csv`, or `markdown` |
+| `--format <FORMAT>` | Report format for commands that support it: `table`, `json`, `csv`, `markdown`, or `summary` |
 | `--help` / `-h` | Print command-specific help |
 
 `--format` applies to report-producing commands. The legacy `--json` flag remains supported as an alias for `--format json` where it was previously available.

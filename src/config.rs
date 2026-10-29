@@ -8,7 +8,7 @@
 //! 3. explicit CLI arguments
 //!
 //! Network and timeout defaults are applied by rewriting clap's default
-//! values before parsing (see [`UserConfig::apply_cli_defaults`]), so an
+//! values before parsing (see [`crate::config::UserConfig::apply_cli_defaults`]), so an
 //! argument the user did not type picks up the config value while an explicit
 //! argument always wins. RPC URLs from `[rpc_urls]` replace the built-in
 //! endpoint for that network (see [`crate::rpc::client::set_endpoint_overrides`]);
@@ -25,7 +25,7 @@
 //! 3. `~/.soroban-cost-estimator/config.toml`
 //!
 //! No file at any default location is not an error. A file that exists but
-//! cannot be read or parsed is reported as [`AppError::Config`].
+//! cannot be read or parsed is reported as [`crate::error::AppError::Config`].
 //!
 //! # Example
 //!
@@ -73,6 +73,8 @@ pub struct UserConfig {
     pub format: Option<OutputFormat>,
     /// RPC timeout in seconds used when `--timeout` is not given.
     pub timeout_secs: Option<u64>,
+    /// Cache freshness period used when `estimate` omits `--cache-ttl`.
+    pub cache_ttl: Option<String>,
     /// Legacy: RPC URL applied to commands that accept `--rpc-url`,
     /// regardless of network. Prefer `[rpc_urls]`.
     pub rpc_url: Option<String>,
@@ -251,6 +253,7 @@ mod tests {
 default_network = "mainnet"
 format = "json"
 timeout_secs = 45
+cache_ttl = "30m"
 
 [rpc_urls]
 testnet = "https://t.example"
@@ -260,6 +263,7 @@ mainnet = "https://m.example"
         assert_eq!(cfg.default_network.as_deref(), Some("mainnet"));
         assert_eq!(cfg.format, Some(OutputFormat::Json));
         assert_eq!(cfg.timeout_secs, Some(45));
+        assert_eq!(cfg.cache_ttl.as_deref(), Some("30m"));
         assert_eq!(cfg.rpc_url_for("testnet"), Some("https://t.example"));
         assert_eq!(cfg.rpc_url_for("mainnet"), Some("https://m.example"));
         assert_eq!(cfg.rpc_url_for("futurenet"), None);

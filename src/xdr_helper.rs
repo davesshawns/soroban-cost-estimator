@@ -54,9 +54,11 @@ pub fn decode_config_entry_xdr(
 pub fn begin_snapshot(network: &str, ledger: u32) -> ConfigSnapshot {
     use chrono::Utc;
     ConfigSnapshot {
+        schema_version: crate::config_snapshot::model::SNAPSHOT_SCHEMA_VERSION,
         network: network.to_string(),
         timestamp: Utc::now().to_rfc3339(),
         ledger,
+        settings_last_modified: std::collections::BTreeMap::new(),
         protocol_version: None,
         contract_compute: None,
         contract_ledger_cost: None,

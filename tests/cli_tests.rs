@@ -303,7 +303,7 @@ fn test_config_diff_help() {
 fn test_watch_help() {
     let (stdout, stderr, code) = run_cli(&["watch", "--help"]);
     assert_eq!(code, 0, "watch --help should exit 0; stderr: {stderr}");
-    for flag in ["--network", "--interval"] {
+    for flag in ["--network", "--rpc-url", "--interval"] {
         assert!(
             stdout.contains(flag),
             "watch help should mention {flag}; got: {stdout}"
@@ -616,8 +616,8 @@ fn test_json_flag_accepted() {
 #[test]
 fn test_format_flag_accepted() {
     // Verify --format is a recognized argument for estimate, including the
-    // new markdown variant (#80).
-    for fmt in ["table", "json", "csv", "markdown"] {
+    // markdown variant (#80) and the summary variant (#533).
+    for fmt in ["table", "json", "csv", "markdown", "summary"] {
         let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--format", fmt]);
         // Should fail because the file doesn't exist, NOT because --format is
         // unknown or the value is invalid.
@@ -1186,6 +1186,64 @@ fn test_estimate_cache_hit_skips_simulation() {
 }
 
 #[test]
+fn test_estimate_uses_default_seven_day_cache_ttl() {
+    // A fresh entry is reused even without --cache-ttl because the default
+    // cache TTL is seven days.
+    let home = temp_home("cache-ttl-default");
+    seed_cache_entry(&home, &chrono::Utc::now().to_rfc3339());
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(
+        code, 0,
+        "the default TTL should reuse a fresh entry: {stderr}"
+    );
+    assert!(stdout.contains("Cache hit"), "got: {stdout}");
+}
+
+#[test]
+fn test_estimate_uses_cache_ttl_from_config() {
+    // A config TTL of 30 minutes expires this two-hour-old entry, so the
+    // command must attempt simulation instead of reporting a cache hit.
+    let home = temp_home("cache-ttl-config");
+    seed_cache_entry(
+        &home,
+        &(chrono::Utc::now() - chrono::TimeDelta::hours(2)).to_rfc3339(),
+    );
+    let config = home.join("config.toml");
+    std::fs::write(&config, "cache_ttl = \"30m\"\n").expect("write config");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "--config",
+            config.to_str().expect("UTF-8 config path"),
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 1, "the expired entry must re-simulate");
+    assert!(!stdout.contains("Cache hit"), "got: {stdout}");
+    assert!(
+        stderr.contains("HTTP request failed") || stderr.contains("error sending request"),
+        "re-simulation should hit the dead endpoint; got: {stderr}"
+    );
+}
+
+#[test]
 fn test_estimate_cache_hit_json_output() {
     let home = temp_home("cache-ttl-json");
     seed_cache_entry(&home, &chrono::Utc::now().to_rfc3339());
@@ -1340,6 +1398,38 @@ fn test_config_snapshot_retain_flag_accepted() {
             "Error: failed to locate RPC endpoint: not configured for network not-a-network"
         ),
         "the failure should come from the network, not the flag; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_skip_unchanged_flag_accepted() {
+    // `--skip-unchanged` must be a recognized argument: the run fails on the
+    // unknown network (before any RPC), not on the flag itself.
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--network",
+        "not-a-network",
+        "--skip-unchanged",
+    ]);
+    assert_eq!(code, 1, "an unknown network should exit 1");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--skip-unchanged should be a recognized argument; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("failed to locate RPC endpoint"),
+        "the failure should come from the network, not the flag; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_help_documents_skip_unchanged() {
+    let (stdout, stderr, code) = run_cli(&["config", "snapshot", "--help"]);
+    assert_eq!(code, 0, "snapshot --help should exit 0: {stderr}");
+    assert!(
+        stdout.contains("--skip-unchanged"),
+        "snapshot help should document --skip-unchanged; got: {stdout}"
     );
 }
 
@@ -1649,6 +1739,61 @@ fn test_cache_warm_help() {
 }
 
 #[test]
+fn test_config_cache_warm_help() {
+    let (stdout, stderr, code) = run_cli(&["config", "cache", "warm", "--help"]);
+    assert_eq!(
+        code, 0,
+        "config cache warm --help should exit 0; stderr: {stderr}"
+    );
+    for flag in ["--wasm", "--network", "--rpc-url", "--id", "--json"] {
+        assert!(
+            stdout.contains(flag),
+            "config cache warm help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_config_cache_warm_missing_wasm_errors() {
+    let (_, stderr, code) = run_cli(&["config", "cache", "warm"]);
+    assert_ne!(code, 0, "config cache warm without --wasm should error");
+    assert!(
+        stderr.contains("error") || stderr.contains("required"),
+        "stderr should indicate error: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_cache_warm_nonexistent_wasm_file() {
+    let (_, stderr, code) = run_cli(&["config", "cache", "warm", "--wasm", "no/such/file.wasm"]);
+    assert_eq!(code, 1, "a missing WASM file should exit 1");
+    assert!(
+        stderr.contains("file not found") || stderr.contains("Error: failed to perform I/O"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_cache_warm_unknown_network() {
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "cache",
+        "warm",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--network",
+        "not-a-network",
+    ]);
+    assert_eq!(code, 1, "an unknown network should exit 1");
+    assert!(
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn test_cache_warm_missing_wasm_errors() {
     let (_, stderr, code) = run_cli(&["cache", "warm"]);
     assert_ne!(code, 0, "cache warm without --wasm should error");
@@ -1810,6 +1955,41 @@ fn test_config_diff_loads_valid_snapshot_before_network() {
     assert!(
         !stderr.contains("Error: failed to parse snapshot"),
         "a valid snapshot must not be reported as malformed; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_diff_rpc_url_overrides_unknown_network() {
+    // `--rpc-url` must bypass network-name resolution for the live fetch: an
+    // otherwise unknown network name combined with --rpc-url fails on the RPC
+    // call itself (the dead endpoint), not on endpoint resolution.
+    let home = temp_home("diff-rpc-url-override");
+    let path = home.join("snapshot.json");
+    std::fs::write(&path, snapshot_json("not-a-network", 1000)).expect("write fixture");
+
+    let (_, stderr, code) = run_cli_in_home(
+        &[
+            "--max-retries",
+            "0",
+            "config",
+            "diff",
+            "--network",
+            "not-a-network",
+            "--against",
+            path.to_str().unwrap(),
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+    assert_eq!(code, 1, "the dead endpoint should still fail");
+    assert!(
+        !stderr.contains("not configured for network"),
+        "--rpc-url should override network resolution; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("failed to send HTTP request"),
+        "the failure should come from the HTTP call; got: {stderr}"
     );
 }
 
@@ -2267,24 +2447,353 @@ fn test_wasm_info_nested_and_flat_agree() {
 
 #[test]
 fn test_watch_interval_suffixes_are_parsed() {
-    // `30m` must resolve to 1800s in the banner — the interval parser is unit
-    // tested in-crate, this pins the wiring through the CLI.
+    // Every duration suffix (and the bare-seconds form) must resolve to the
+    // right number of seconds in the banner — the parser itself is unit tested
+    // in-crate (issue #359), this pins the wiring through the CLI.
     let home = temp_home("watch-interval");
+
+    for (interval, seconds) in [
+        ("10s", 10),
+        ("30m", 1_800),
+        ("1h", 3_600),
+        ("1d", 86_400),
+        ("60", 60),
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+            .args([
+                "watch",
+                "--network",
+                "not-a-network",
+                "--interval",
+                interval,
+            ])
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn watch");
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let _ = child.kill();
+        let output = child.wait_with_output().expect("failed to reap watch");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("every {seconds}s")),
+            "`{interval}` should resolve to {seconds}s; got: {stdout}"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `watch` over WebSocket ledger-close notifications (Issue #305)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Serves JSON-RPC over HTTP *and* WebSocket on a single loopback port.
+///
+/// `watch` is pointed at `ws://127.0.0.1:PORT/ws`; the command rewrites that
+/// same `--rpc-url` to `http://127.0.0.1:PORT` for its config fetches, so both
+/// halves must answer on one port. The WebSocket half acknowledges the
+/// ledger-close subscription and then pushes one notification per ledger,
+/// which is what makes the CLI re-check the config. Returns the `ws://` URL
+/// and a sender that stops the server thread.
+///
+/// The nested handlers keep the HTTP and WebSocket halves side by side (they
+/// share one port and one stop channel), which makes this deliberately long.
+#[allow(clippy::too_many_lines)]
+fn start_mock_ws_rpc_server(ledgers: &[u32]) -> (String, std::sync::mpsc::Sender<()>) {
+    use tokio::net::TcpListener;
+
+    let ledgers = ledgers.to_vec();
+    let (tx_stop, rx_stop) = std::sync::mpsc::channel::<()>();
+    let (tx_addr, rx_addr) = std::sync::mpsc::channel::<String>();
+
+    // One connection per task: `watch` opens the config fetch and the
+    // WebSocket subscription as separate connections.
+    async fn serve_connection(stream: tokio::net::TcpStream, ledgers: Vec<u32>) {
+        // Peek before consuming: a WebSocket handshake must be handed to
+        // tungstenite intact, and `peek` leaves the bytes in the socket.
+        let mut handshake = String::new();
+        for _ in 0..200 {
+            let mut buf = [0_u8; 2048];
+            match stream.peek(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    handshake = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                    if handshake.contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        if handshake.contains("upgrade: websocket") {
+            serve_ws(stream, &ledgers).await;
+        } else {
+            serve_http(stream).await;
+        }
+    }
+
+    /// Answers the request/response JSON-RPC calls `watch` makes.
+    async fn serve_http(mut stream: tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut buf = [0_u8; 8192];
+        let mut request = String::new();
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    request.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if request.contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let body = if request.contains("getHealth") {
+            r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy","latestLedger":42}}"#
+                .to_string()
+        } else if request.contains("getLedgerEntries") {
+            r#"{"jsonrpc":"2.0","id":1,"result":{"latestLedger":42,"entries":[]}}"#.to_string()
+        } else {
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#
+                .to_string()
+        };
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+    }
+
+    /// Acknowledges the `subscribe` request, then streams ledger closes.
+    async fn serve_ws(stream: tokio::net::TcpStream, ledgers: &[u32]) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        while let Some(Ok(message)) = ws.next().await {
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            if request.get("method").and_then(|m| m.as_str()) != Some("subscribe") {
+                continue;
+            }
+            let id = request
+                .get("id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let ack = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "latestLedger": 42 },
+            });
+            let _ = ws.send(Message::text(ack.to_string())).await;
+            for ledger in ledgers {
+                let notification = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "ledgerClose",
+                    "params": { "ledger": ledger },
+                });
+                let _ = ws.send(Message::text(notification.to_string())).await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    std::thread::spawn(move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        runtime.block_on(async move {
+            let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+                return;
+            };
+            let Ok(addr) = listener.local_addr() else {
+                return;
+            };
+            if tx_addr
+                .send(format!("ws://127.0.0.1:{}/ws", addr.port()))
+                .is_err()
+            {
+                return;
+            }
+
+            loop {
+                if rx_stop.try_recv().is_ok() {
+                    break;
+                }
+                let accepted =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                        .await;
+                if let Ok(Ok((stream, _))) = accepted {
+                    let ledgers = ledgers.clone();
+                    tokio::spawn(serve_connection(stream, ledgers));
+                }
+            }
+        });
+    });
+
+    (
+        rx_addr
+            .recv()
+            .expect("mock server should report its address"),
+        tx_stop,
+    )
+}
+
+/// Spawns a long-running command and streams its stdout lines over a channel,
+/// so a test can assert on output that arrives while the process is alive.
+/// Returns the child, the line receiver, and the reader thread.
+fn spawn_streaming(
+    args: &[&str],
+    home: &Path,
+) -> (
+    std::process::Child,
+    std::sync::mpsc::Receiver<String>,
+    std::thread::JoinHandle<()>,
+) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args(["watch", "--network", "not-a-network", "--interval", "30m"])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
+        .args(args)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("RUST_LOG", "error")
         .stdout(std::process::Stdio::piped())
         .spawn()
-        .expect("failed to spawn watch");
+        .expect("failed to spawn CLI");
 
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (tx_line, rx_line) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if tx_line.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    (child, rx_line, reader)
+}
+
+/// Collects streamed lines until one contains `needle` or `timeout` elapses.
+/// Returns every line seen so far and whether the needle was found.
+fn wait_for_line(
+    rx: &std::sync::mpsc::Receiver<String>,
+    needle: &str,
+    timeout: std::time::Duration,
+) -> (String, bool) {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut seen = String::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(line) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            let found = line.contains(needle);
+            seen.push_str(&line);
+            seen.push('\n');
+            if found {
+                return (seen, true);
+            }
+        }
+    }
+    (seen, false)
+}
+
+#[test]
+fn test_watch_rechecks_config_on_websocket_ledger_close() {
+    // The poll interval is an hour, so any re-check must have been driven by the
+    // WebSocket ledger-close notification rather than by interval polling.
+    let (ws_url, _stop) = start_mock_ws_rpc_server(&[4_242]);
+    let home = temp_home("watch-websocket");
+    let (mut child, rx, reader) = spawn_streaming(
+        &[
+            "watch",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            &ws_url,
+            "--interval",
+            "1h",
+        ],
+        &home,
+    );
+
+    let (seen, saw_ledger_close) = wait_for_line(
+        &rx,
+        "Ledger 4242 closed",
+        std::time::Duration::from_secs(20),
+    );
+
     let _ = child.kill();
-    let output = child.wait_with_output().expect("failed to reap watch");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let _ = child.wait();
+    let _ = reader.join();
+
     assert!(
-        stdout.contains("every 1800s"),
-        "`30m` should resolve to 1800s; got: {stdout}"
+        seen.contains("Subscribed to ledger-close notifications"),
+        "watch should subscribe over WebSocket; saw:\n{seen}"
+    );
+    assert!(
+        saw_ledger_close,
+        "watch should re-check the config when a ledger closes; saw:\n{seen}"
+    );
+    assert!(
+        !seen.contains("polling every"),
+        "watch should not fall back to polling when the WebSocket works; saw:\n{seen}"
+    );
+}
+
+#[test]
+fn test_watch_falls_back_to_polling_when_websocket_is_unreachable() {
+    // A URL that speaks no WebSocket: `watch` must degrade to interval polling
+    // instead of exiting. The connect budget is 5 attempts with 1s, 2s, 4s, 8s
+    // backoff, so the fallback banner arrives well inside this deadline.
+    let home = temp_home("watch-websocket-fallback");
+    let (mut child, rx, reader) = spawn_streaming(
+        &[
+            "watch",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "ws://127.0.0.1:1/ws",
+            "--interval",
+            "30m",
+        ],
+        &home,
+    );
+
+    let (seen, fell_back) = wait_for_line(
+        &rx,
+        "polling every 1800s",
+        std::time::Duration::from_secs(60),
+    );
+
+    let status = child.try_wait().expect("failed to poll watch process");
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+
+    assert!(
+        status.is_none(),
+        "watch should keep running after the WebSocket failure; saw:\n{seen}"
+    );
+    assert!(
+        fell_back,
+        "watch should announce the HTTP polling fallback; saw:\n{seen}"
     );
 }
 
@@ -2804,6 +3313,19 @@ fn start_mock_rpc_server(
     min_fee: &'static str,
     ledger: u64,
 ) -> (String, std::sync::mpsc::Sender<()>) {
+    start_mock_rpc_server_delayed(live_tx_data, min_fee, ledger, 0)
+}
+
+/// Same mock server, but every response is delayed by `delay_ms` so tests can
+/// assert on measured round-trip durations without depending on how fast
+/// loopback happens to be (`Instant::elapsed().as_millis()` truncates, so a
+/// sub-millisecond reply reports 0 ms).
+fn start_mock_rpc_server_delayed(
+    live_tx_data: &'static str,
+    min_fee: &'static str,
+    ledger: u64,
+    delay_ms: u64,
+) -> (String, std::sync::mpsc::Sender<()>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -2884,6 +3406,10 @@ fn start_mock_rpc_server(
                     } else {
                         r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#.to_string()
                     };
+
+                    if delay_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
 
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -4474,6 +5000,47 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
         !stderr.contains("failed to locate RPC endpoint"),
         "offline diff must not resolve a network; got: {stderr}"
     );
+}
+
+#[test]
+fn manifest_validates_relative_paths_and_network_overrides_offline() {
+    let manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/manifests/valid.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .current_dir(std::env::temp_dir())
+        .env("RUST_LOG", "error")
+        .args(["estimate", "--manifest"])
+        .arg(manifest)
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entries: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(entries[0]["function"], "ping");
+    assert_eq!(entries[1]["network"], "local");
+    assert_eq!(entries[1]["rpc_url"], DEAD_RPC);
+}
+
+#[test]
+fn manifest_errors_identify_entry_and_source_before_rpc() {
+    for (fixture, expected) in [
+        ("missing-field", "missing field `function`"),
+        ("unknown-version", "unsupported version 99"),
+        ("invalid-path", "contracts[2]"),
+        ("invalid-function", "unknown function"),
+        ("invalid-args", "expects 0 arguments"),
+    ] {
+        let path = format!("tests/fixtures/manifests/{fixture}.toml");
+        let (_, stderr, code) = run_cli(&["estimate", "--manifest", &path, "--rpc-url", DEAD_RPC]);
+        assert_ne!(code, 0);
+        assert!(stderr.contains(expected), "{fixture}: {stderr}");
+        assert!(stderr.contains(&format!("{path}:")), "{stderr}");
+        assert!(!stderr.contains("failed to send HTTP"), "{stderr}");
+    }
 }
 
 // ── Cache listing and filtered deletion (#516, #517) ───────────────────────

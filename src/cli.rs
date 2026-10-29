@@ -1,7 +1,6 @@
-use std::path::PathBuf;
-
 use clap::builder::{PossibleValue, TypedValueParser};
 use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 /// Value parser for `--network` that advertises the supported network names to
 /// shell completion generators and `--help` output while still accepting any
@@ -38,15 +37,24 @@ impl TypedValueParser for NetworkValueParser {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "lower")]
+/// Output format selected by the global `--format` flag.
 pub enum OutputFormat {
+    /// Human-readable aligned table (the default).
     #[default]
     Table,
+    /// Machine-readable JSON document.
     Json,
+    /// Comma-separated values, with a header row.
     Csv,
+    /// Markdown tables suitable for PR comments and issue reports.
     Markdown,
+    /// One tab-delimited result line per estimate, for shell pipelines and
+    /// batch logs (see [`crate::report::formatter::SummaryFormatter`]).
+    Summary,
 }
 
 impl OutputFormat {
+    /// Lower-case name used by `--format` and in human-readable output.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -54,6 +62,7 @@ impl OutputFormat {
             Self::Json => "json",
             Self::Csv => "csv",
             Self::Markdown => "markdown",
+            Self::Summary => "summary",
         }
     }
 }
@@ -61,6 +70,42 @@ impl OutputFormat {
 impl std::fmt::Display for OutputFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl CacheAction {
+    /// The explicit `--rpc-url` carried by this action, if any.
+    #[must_use]
+    fn rpc_url(&self) -> Option<&str> {
+        match self {
+            Self::Warm { rpc_url, .. } => rpc_url.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+impl ConfigAction {
+    /// The explicit `--rpc-url` carried by this action, if any.
+    #[must_use]
+    fn rpc_url(&self) -> Option<&str> {
+        match self {
+            Self::Snapshot { rpc_url, .. } | Self::Diff { rpc_url, .. } => rpc_url.as_deref(),
+            Self::Cache { action } => action.rpc_url(),
+            _ => None,
+        }
+    }
+}
+
+fn parse_threshold_percent(value: &str) -> Result<f64, String> {
+    let threshold = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid threshold percentage: {value}"))?;
+    if threshold.is_finite() && threshold >= 0.0 {
+        Ok(threshold)
+    } else {
+        Err(format!(
+            "threshold percentage must be a finite, non-negative number: {value}"
+        ))
     }
 }
 
@@ -95,7 +140,12 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<String>,
 
-    /// Select output format for commands that produce structured output (table, json, csv, markdown).
+    /// Select output format for commands that produce structured output
+    /// (table, json, csv, markdown, summary).
+    ///
+    /// `summary` prints exactly one tab-delimited line per successful
+    /// estimate — see the `summary` section of `docs/commands/estimate.md`
+    /// for the field order and escaping rules.
     #[arg(long, global = true, value_enum)]
     pub format: Option<OutputFormat>,
 
@@ -103,10 +153,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N")]
     pub rps: Option<u64>,
 
-    /// HTTP request timeout for RPC calls, in seconds (applies to every
-    /// network call).
+    /// Per-attempt HTTP request timeout for RPC calls, in seconds (applies to
+    /// each individual network attempt).
     #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
     pub timeout: u64,
+
+    /// Optional overall RPC operation deadline, in seconds, spanning all retry
+    /// attempts, backoff delays, and fallback endpoint calls. 0 disables it.
+    #[arg(long, global = true, value_name = "SECS")]
+    pub total_timeout: Option<u64>,
 
     /// TCP connection establishment timeout for RPC calls, in seconds. Bounds
     /// only the initial connect — a dead or unreachable host fails within
@@ -138,6 +193,11 @@ pub struct Cli {
     /// returns a transient gateway error (HTTP 502/503/504).
     #[arg(long, global = true, value_name = "URL")]
     pub rpc_fallback_url: Option<String>,
+
+    /// HTTP or HTTPS proxy for RPC requests. Takes precedence over standard
+    /// proxy environment variables for this invocation.
+    #[arg(long, global = true, value_name = "URL")]
+    pub rpc_proxy: Option<String>,
 
     /// Retry transient RPC failures up to N times (default 3), using
     /// exponential backoff (500ms, then doubled between attempts). 0
@@ -184,11 +244,13 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "BYTES")]
     pub max_wasm_size: Option<u64>,
 
+    /// Subcommand to execute.
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Subcommand, Debug)]
+/// Top-level CLI subcommands.
 pub enum Command {
     /// Simulate a single contract invocation and print the cost report.
     ///
@@ -197,8 +259,12 @@ pub enum Command {
     Estimate {
         /// Path to a compiled Soroban contract `.wasm` file. Repeat the flag
         /// to evaluate multiple contracts in a single batch run.
-        #[arg(long, short, value_name = "PATH", required_unless_present = "wasm_dir")]
+        #[arg(long, short, value_name = "PATH", required_unless_present_any = ["wasm_dir", "manifest"])]
         wasm: Vec<PathBuf>,
+
+        /// Version 1 TOML batch manifest; paths are relative to this file.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["wasm", "wasm_dir", "fn", "args", "id", "interactive", "cache_ttl", "compare", "clear_cache", "no_cache", "history", "auto_snapshot", "diff", "wasm_new", "watch", "project", "repeat"])]
+        manifest: Option<PathBuf>,
 
         /// Directory of `.wasm` files to evaluate as a batch (non-recursive).
         #[arg(long, value_name = "DIR")]
@@ -207,12 +273,17 @@ pub enum Command {
         /// Network to simulate against.
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
+        /// Explicit RPC URL (overrides network-based resolution).
         #[arg(long)]
         rpc_url: Option<String>,
+        /// Contract function to invoke (omit to list available functions).
         #[arg(long)]
         r#fn: Option<String>,
+        /// Deployed contract ID (64 hex chars) to invoke the function against.
         #[arg(long)]
         id: Option<String>,
+        /// Contract argument as `KEY=VALUE`, repeatable. Values are converted
+        /// to the type declared by the contract spec.
         #[arg(long = "arg", value_name = "KEY=VAL")]
         args: Vec<String>,
 
@@ -222,8 +293,8 @@ pub enum Command {
         #[arg(long, short = 'i')]
         interactive: bool,
 
-        /// Skip re-simulation when a cached estimate is still fresh
-        /// (e.g. "30m", "1h", "7d"; bare value = seconds).
+        /// Override the cache freshness TTL from config.toml (default: 7d).
+        /// Accepts "30m", "1h", "7d", or bare seconds.
         #[arg(long, value_name = "DURATION")]
         cache_ttl: Option<String>,
 
@@ -236,6 +307,11 @@ pub enum Command {
         /// simulation (e.g. after upgrading the tool or a network upgrade).
         #[arg(long)]
         clear_cache: bool,
+
+        /// Automatically quarantine a corrupt cache database to a timestamped
+        /// backup and initialize a clean cache if corruption is detected.
+        #[arg(long)]
+        recover_cache: bool,
 
         /// Bypass the estimate cache entirely: never read a cached estimate
         /// (including under `--cache-ttl`) and never write the fresh result
@@ -294,6 +370,15 @@ pub enum Command {
         /// fee/CPU consistency across runs.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
         repeat: u32,
+
+        /// Include per-entry summaries of the simulation's events and state
+        /// changes (issue #525). Without this flag the report still shows
+        /// their counts when present, but never any payload bytes; with it,
+        /// bounded hex previews (32 bytes, 4 topics, 10 entries) are added.
+        /// Raw XDR/JSON payloads are never printed in full and are not
+        /// cached.
+        #[arg(long)]
+        show_events: bool,
     },
 
     /// Enumerate all public contract functions and estimate each one.
@@ -332,6 +417,7 @@ pub enum Command {
         #[arg(long = "fn", value_name = "NAME")]
         fn_names: Vec<String>,
 
+        /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
 
@@ -340,32 +426,47 @@ pub enum Command {
         #[arg(long)]
         auto_snapshot: bool,
     },
+    /// Print a summary of a compiled contract's exports and metadata.
     WasmInfo {
+        /// Path to the compiled Soroban contract `.wasm` file.
         #[arg(long, short)]
         wasm: String,
+        /// Output the parsed structure as JSON.
         #[arg(long)]
         json: bool,
     },
     /// Inspect a compiled Soroban WASM artifact (offline).
     Wasm {
+        /// The WASM inspection action to run.
         #[command(subcommand)]
         action: WasmAction,
     },
+    /// Inspect and manage network config snapshots.
     Config {
+        /// The config action to run.
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Query and manage the estimate cache.
     Cache {
+        /// The cache action to run.
         #[command(subcommand)]
         action: CacheAction,
     },
+    /// Stream ledger-close notifications and report config changes.
     Watch {
+        /// Network to watch.
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
+        /// RPC endpoint to watch (e.g. a `ws://` URL). Defaults to the
+        /// network's public endpoint.
+        #[arg(long)]
+        rpc_url: Option<String>,
+        /// Polling interval used when WebSocket streaming is unavailable.
         #[arg(long, default_value = "1h")]
         interval: String,
         /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_threshold_percent)]
         threshold_percent: Option<f64>,
     },
 
@@ -377,7 +478,27 @@ pub enum Command {
     },
 }
 
+impl Command {
+    /// The explicit `--rpc-url` supplied to this subcommand, if any.
+    ///
+    /// Nested cache and config commands surface the URL of the action that
+    /// owns it, so the CLI can validate the endpoint before any file or
+    /// network work begins.
+    #[must_use]
+    pub fn rpc_url(&self) -> Option<&str> {
+        match self {
+            Self::Estimate { rpc_url, .. }
+            | Self::EstimateAll { rpc_url, .. }
+            | Self::Watch { rpc_url, .. } => rpc_url.as_deref(),
+            Self::Cache { action } => action.rpc_url(),
+            Self::Config { action } => action.rpc_url(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
+/// Subcommands of `wasm`.
 pub enum WasmAction {
     /// Print size, SHA-256, exported signatures, embedded metadata, and the
     /// section size summary for a WASM file. Fully offline: no RPC calls.
@@ -392,6 +513,7 @@ pub enum WasmAction {
 }
 
 #[derive(Subcommand, Debug)]
+/// Subcommands of `cache`.
 pub enum CacheAction {
     /// Export cached estimates as a versioned JSON document (schema
     /// version, export timestamp, and estimate records) for backup or
@@ -508,8 +630,10 @@ pub enum CacheAction {
 
     /// Pre-populate the cache by estimating every exported function.
     Warm {
+        /// Path to the compiled Soroban contract `.wasm` file.
         #[arg(long, short)]
         wasm: String,
+        /// Network to simulate against.
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
 
@@ -520,6 +644,7 @@ pub enum CacheAction {
         /// Deployed contract ID (64 hex chars) to invoke each function against.
         #[arg(long)]
         id: Option<String>,
+        /// Output as JSON instead of a human-readable summary.
         #[arg(long)]
         json: bool,
     },
@@ -566,6 +691,17 @@ pub enum CacheAction {
     /// Show cache health overview: total entries, disk usage, and age.
     Stats {
         /// Output as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Recover safely from a corrupt SQLite cache database by quarantining it to a timestamped backup and initializing a new cache.
+    Recover {
+        /// Force recovery even if corruption is not automatically detected.
+        #[arg(long)]
+        force: bool,
+
+        /// Output the recovery report as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -660,6 +796,7 @@ pub enum SnapshotAction {
 }
 
 #[derive(Subcommand, Debug)]
+/// Subcommands of `config`.
 pub enum ConfigAction {
     /// Fetch all ConfigSetting entries and save a timestamped snapshot.
     ///
@@ -668,12 +805,22 @@ pub enum ConfigAction {
     /// command's own flags.
     #[command(args_conflicts_with_subcommands = true)]
     Snapshot {
+        /// Optional on-disk snapshot subcommand; when omitted a new snapshot
+        /// is fetched from the network.
         #[command(subcommand)]
         action: Option<SnapshotAction>,
+        /// Network to snapshot.
         #[arg(long, default_value = "testnet")]
         network: String,
+
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Explicit output path (defaults to ~/.soroban-cost-estimator/snapshots/).
         #[arg(long)]
         out: Option<String>,
+        /// Output as JSON instead of a human-readable summary.
         #[arg(long)]
         json: bool,
 
@@ -681,6 +828,12 @@ pub enum ConfigAction {
         /// older ones once the new snapshot is safely on disk.
         #[arg(long, value_name = "COUNT")]
         retain: Option<usize>,
+
+        /// Do not write a new snapshot when the fetched configuration matches
+        /// the latest snapshot for the network. The command exits 0 whether a
+        /// snapshot was written or skipped.
+        #[arg(long)]
+        skip_unchanged: bool,
     },
     /// List all saved config snapshots with their timestamp and ledger.
     List {
@@ -691,8 +844,15 @@ pub enum ConfigAction {
 
     /// Diff the current network config against the most recent snapshot.
     Diff {
+        /// Network whose live configuration to compare.
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
+
+        /// Explicit RPC URL (overrides network-based resolution).
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Explicit snapshot path to compare against (defaults to latest).
         #[arg(long)]
         against: Option<String>,
 
@@ -705,7 +865,7 @@ pub enum ConfigAction {
         pricing_only: bool,
 
         /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_threshold_percent)]
         threshold_percent: Option<f64>,
 
         /// Print a single-line summary (counts of pricing/non-pricing changes)
@@ -729,15 +889,21 @@ pub enum ConfigAction {
         #[arg(long)]
         fail_on_any_change: bool,
     },
+    /// Show the saved snapshot history for a network.
     History {
+        /// Network whose snapshot history to show.
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
     },
+    /// Show when the network configuration last changed.
     LastChanged {
+        /// Network to inspect.
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
     },
+    /// Validate the stored snapshots for a network.
     Validate {
+        /// Network whose snapshots to validate.
         #[arg(long, default_value = "testnet", value_parser = NetworkValueParser)]
         network: String,
     },
@@ -761,6 +927,7 @@ pub enum ConfigAction {
 
     /// Query or manage the estimate cache.
     Cache {
+        /// The cache action to run.
         #[command(subcommand)]
         action: CacheAction,
     },
@@ -768,6 +935,9 @@ pub enum ConfigAction {
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+/// Global `--color` choice, encoded as `0` (auto), `1` (always), or `2`
+/// (never). Set once from the parsed CLI so formatters can decide whether to
+/// emit ANSI escapes without threading the flag through every call site.
 pub static COLOR_CHOICE: AtomicU8 = AtomicU8::new(0);
 
 /// Global `--quiet` state, mirroring [`COLOR_CHOICE`]. Set once from the
@@ -824,6 +994,7 @@ pub fn chart_width_for(quiet: bool, is_tty: bool, columns: Option<usize>) -> Opt
     }
 }
 
+/// Record the global `--color` choice for later [`should_colorize`] queries.
 pub fn init_color(choice: clap::ColorChoice) {
     let val = match choice {
         clap::ColorChoice::Auto => 0,
@@ -833,6 +1004,10 @@ pub fn init_color(choice: clap::ColorChoice) {
     COLOR_CHOICE.store(val, Ordering::Relaxed);
 }
 
+/// Whether ANSI color should be emitted.
+///
+/// `--color always`/`never` wins; under `auto` this honors the `NO_COLOR`
+/// environment variable and checks whether stdout is a terminal.
 pub fn should_colorize() -> bool {
     match COLOR_CHOICE.load(Ordering::Relaxed) {
         1 => true,
@@ -891,5 +1066,15 @@ mod tests {
                 "completion script for {shell:?} should reference {bin_name}"
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn threshold_percent_accepts_finite_non_negative_values() {
+        assert!((parse_threshold_percent("10").unwrap() - 10.0).abs() < f64::EPSILON);
+        assert!((parse_threshold_percent("500.5").unwrap() - 500.5).abs() < f64::EPSILON);
+        assert!(parse_threshold_percent("-1").is_err());
+        assert!(parse_threshold_percent("NaN").is_err());
+        assert!(parse_threshold_percent("inf").is_err());
     }
 }

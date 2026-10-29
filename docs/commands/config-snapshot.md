@@ -14,6 +14,7 @@ Options:
       --out <OUT>          Explicit output path (defaults to ~/.soroban-cost-estimator/snapshots/)
       --json               Print the snapshot as JSON instead of the summary lines
       --retain <COUNT>     Keep only the N most recent snapshots for the network
+      --skip-unchanged     Do not write a new snapshot when the configuration is unchanged
   -h, --help               Print help
 
 Commands:
@@ -36,6 +37,13 @@ Commands:
 - `--out` writes to an explicit path instead of the default directory.
 - `--retain <COUNT>` runs a retention pass once the new snapshot is safely on
   disk (see [Retention](#retention)).
+- The file declares its schema version (see
+  [Schema versioning](#schema-versioning)); files written by a newer release
+  are rejected with the file name and an upgrade hint instead of being
+  misread.
+- `--skip-unchanged` compares the fetched configuration with the latest stored
+  snapshot and writes nothing when they match (see
+  [Skipping unchanged captures](#skipping-unchanged-captures)).
 
 ## Example
 
@@ -48,13 +56,39 @@ Actual output from a live testnet run:
 ```text
 Config snapshot saved to: /home/you/.soroban-cost-estimator/snapshots/testnet-2026-08-04T07-15-38.487702259+00-00.json
 Network: testnet
-Ledger:  3470630
+Ledger:  4635341
 Time:    2026-08-04T07:15:38.487702259+00:00
 ```
 
-The printed `Ledger` is the last ledger at which the config entries were
-modified on-chain — it is *not* the network's current ledger, and that is
-intentional: it is the ledger against which stale-cache checks are made.
+The printed `Ledger` is the network's **current** ledger at the moment of the
+fetch, as reported by the node's `latestLedger`. It may trail Horizon or
+`getLatestLedger` by a ledger or two, which is normal — the two endpoints close
+ledgers independently.
+
+This is deliberately *not* the ledger at which the config entries were last
+modified. Config settings only change on protocol-governance events, so that
+value sits frozen between upgrades and would leave every snapshot reporting the
+same long-stale ledger. If you need the per-setting modification ledgers, they
+are kept per setting in `settings_last_modified`:
+
+```json
+"ledger": 4635341,
+"settings_last_modified": {
+  "CONFIG_SETTING_CONTRACT_BANDWIDTH_V0": 606666,
+  "CONFIG_SETTING_CONTRACT_COMPUTE_V0": 606666,
+  "CONFIG_SETTING_CONTRACT_EVENTS_V0": 606666,
+  "CONFIG_SETTING_CONTRACT_HISTORICAL_DATA_V0": 606666,
+  "CONFIG_SETTING_CONTRACT_LEDGER_COST_V0": 3470630,
+  "CONFIG_SETTING_STATE_ARCHIVAL": 2332
+}
+```
+
+So `ledger` answers *"when was this snapshot taken?"* and
+`settings_last_modified` answers *"when did each price last move?"* — two
+different questions, now both answerable from one snapshot.
+
+Snapshots written by earlier versions have no `settings_last_modified` key and
+still load; the field simply reads as empty for them.
 
 ## What you get
 
@@ -71,6 +105,87 @@ the fee rates used by `estimate` (see [Resource Fees](../concepts/resource-fees.
 Take a fresh snapshot after every protocol vote and keep them around:
 [`config diff`](config-diff.md) compares the current configuration against
 your most recent snapshot.
+
+## Schema versioning
+
+Every new snapshot starts with an explicit schema marker:
+
+```json
+{
+  "schema_version": 1,
+  "network": "testnet",
+  "timestamp": "2026-09-24T21:04:11.016322+00:00",
+  "ledger": 3470630
+}
+```
+
+- Snapshots saved before the marker existed have no `schema_version` key and
+  are treated as **version 1**, the documented initial schema. Reading one
+  never rewrites it: the file keeps its original shape until you explicitly
+  save a new snapshot.
+- A file that declares a version newer than this build understands is
+  rejected across every read path (`list`, `diff`, `validate`, `--against`,
+  retention) with a message naming the file and recommending an upgrade:
+
+  ```text
+  Error: failed to load snapshot: /home/you/.soroban-cost-estimator/snapshots/testnet-2026-10-01T00-00-00+00-00.json declares schema version 2, but this build supports up to 1 (upgrade soroban-cost-estimator to read it)
+  ```
+
+  The file is left untouched, so the newer release can keep using it.
+- `config snapshot validate` reports the same message and marks the file
+  invalid. `config export` skips such files with a warning rather than
+  downgrading them into a bundle it cannot represent faithfully (and
+  `config import` rejects a bundle that contains one).
+
+## Skipping unchanged captures
+
+Scheduled collection can run more often than network pricing changes. Add
+`--skip-unchanged` to avoid writing a duplicate file each time:
+
+```bash
+soroban-cost-estimator config snapshot --network testnet --skip-unchanged --retain 30
+```
+
+After fetching, the tool compares the **decoded data fields** — network,
+protocol version, and all six config settings — against the latest snapshot
+for that network. The timestamp, the snapshot's last-modified ledger, and the
+schema version are deliberately ignored, so capturing the same values again
+does not count as a change. A real fee change, a protocol-version bump, or a
+different network always writes a new file.
+
+When nothing changed:
+
+```text
+Configuration unchanged; no new snapshot written.
+Latest:  /home/you/.soroban-cost-estimator/snapshots/testnet-2026-09-24T21-04-11.016322+00-00.json
+Network: testnet
+Ledger:  3470630
+Time:    2026-09-25T09:00:00.000000+00:00
+```
+
+- **Exit status is `0`** whether a snapshot was written or skipped. An
+  unchanged configuration is a successful scheduled run, not a drift error;
+  use `config diff` when you want a non-zero exit on pricing changes.
+- With `--json` and `--format json`, the skipped result is a small document
+  instead of a snapshot, so automation can branch on `status`:
+
+  ```json
+  {
+    "status": "unchanged",
+    "network": "testnet",
+    "ledger": 3470630,
+    "timestamp": "2026-09-25T09:00:00.000000+00:00",
+    "latest_snapshot": "/home/you/.soroban-cost-estimator/snapshots/testnet-2026-09-24T21-04-11.016322+00-00.json"
+  }
+  ```
+
+  `--format csv` uses the header `status,network,ledger,timestamp,path` and
+  `--format markdown` adds a `Status | unchanged` row.
+- The first snapshot for a network is always written, and an explicit `--out`
+  path is always written — the flag exists for managed snapshot history, not
+  for redirecting a single capture.
+- `--retain` still runs after an unchanged capture, so a directory that grew
+  before this mode was enabled is still trimmed.
 
 ## Deleting snapshots
 
